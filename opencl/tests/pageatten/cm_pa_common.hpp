@@ -41,7 +41,14 @@ void pa_lsc_u8(
     constexpr uint o_pitch = (num_heads * head_size * sizeof(half));
     constexpr uint q_pitch = is_q_fused ? ((num_heads + num_kv_heads*2) * head_size * sizeof(half)) : o_pitch;
     //[block_num, kv_heads, block_size, head_size]
+    // kv_pitch: bytes per token row for current vectorized channel slice.
+#if defined(CMPA_K_BY_CHANNEL) && CMPA_K_BY_CHANNEL
+    // By-channel layout flattened: per kv_head stride = head_size*(CMPA_BLOCK_SZ+4) bytes
+    // We still iterate channels in 'k' loop; width now (CMPA_BLOCK_SZ+4) bytes for each channel region.
+    constexpr uint kv_pitch = (CMPA_BLOCK_SZ + 4); // bytes per channel region (token bytes + 4 scale/zp bytes)
+#else
     constexpr uint kv_pitch = head_size * sizeof(uint8_t);
+#endif
 
     vector<float, q_step> cur_max;
     vector<float, q_step> cur_sum;
@@ -68,9 +75,23 @@ void pa_lsc_u8(
         }
     }
 
-    lsc::block_2d_desc<uint8_t, 1, kv_step, REG_K> b2dK(k_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
+    lsc::block_2d_desc<uint8_t, 1, kv_step, REG_K> b2dK(k_cache_base,
+#if defined(CMPA_K_BY_CHANNEL) && CMPA_K_BY_CHANNEL
+    // height: CMPA_BLOCK_SZ tokens, width: (CMPA_BLOCK_SZ+4) not used; we will override base ptr per channel
+    CMPA_BLOCK_SZ - 1,
+    (CMPA_BLOCK_SZ + 4) - 1,
+#else
+    CMPA_BLOCK_SZ - 1,
+    head_size*sizeof(uint8_t) - 1,
+#endif
+    kv_pitch - 1, 0, 0);
     lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> b2dV(v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
-    constexpr int quan_blk_stride = CMFLA_NUM_KV_HEADS * (CMFLA_HEAD_SIZE+4) * CMPA_BLOCK_SZ * sizeof(uint8_t);
+    constexpr int quan_blk_stride =
+#if defined(CMPA_K_BY_CHANNEL) && CMPA_K_BY_CHANNEL
+    CMFLA_NUM_KV_HEADS * CMFLA_HEAD_SIZE * (CMPA_BLOCK_SZ + 4);
+#else
+    CMFLA_NUM_KV_HEADS * (CMFLA_HEAD_SIZE+4) * CMPA_BLOCK_SZ * sizeof(uint8_t);
+#endif
     int causal_left = q_start+past_lens;
 
     constexpr uint slm_buff_size = kv_step * head_size * sizeof(half);
@@ -102,8 +123,12 @@ void pa_lsc_u8(
             }
 #endif
             auto cur_block_id = block_indices[kv_pos / CMPA_BLOCK_SZ];
+#if defined(CMPA_K_BY_CHANNEL) && CMPA_K_BY_CHANNEL
+            // In by-channel layout scale/zp are appended inside each channel region at token offset CMPA_BLOCK_SZ.
+#else
             uint32_t dscale_offset = cur_block_id*quan_blk_stride + \
                         CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) + kv_pos%CMPA_BLOCK_SZ*sizeof(half);
+#endif
 
             uint slm_offset = (slm_buff_id_write & 3) * slm_buff_size;
             vector<half, kv_step> dscale;
@@ -112,6 +137,28 @@ void pa_lsc_u8(
 
             slm_buff_id_write ++;
             if (wg_local_id < local_size/2) {
+#if defined(CMPA_K_BY_CHANNEL) && CMPA_K_BY_CHANNEL
+                // By-channel: load per channel region, extract scale/zp (single half each), broadcast
+                matrix<half, kv_step, REG_K> kmat;
+                auto quanKmat = kmat.format<half, 2, kv_step * REG_K/2>()[1].format<uint8_t, kv_step, REG_K>();
+                for(int k = REG_K*wg_local_id; k < head_size; k += REG_K*(local_size/2)) {
+                    // base ptr for this channel group
+                    uint8_t* channel_base = reinterpret_cast<uint8_t*>(k_cache_base + cur_block_id*quan_blk_stride + k*(CMPA_BLOCK_SZ+4));
+                    // load tokens slice (kv_step rows starting at kv_pos%CMPA_BLOCK_SZ)
+                    b2dK.set_base_ptr(channel_base);
+                    b2dK.set_block_y(kv_pos % CMPA_BLOCK_SZ);
+                    cm_load<lsc::Normal>(quanKmat.format<uint8_t>(), b2dK.set_block_x(0));
+                    // read scale & zp (each half) from tail; broadcast
+                    half dq_scale_val = *reinterpret_cast<half*>(channel_base + CMPA_BLOCK_SZ);
+                    half zp_val = *reinterpret_cast<half*>(channel_base + CMPA_BLOCK_SZ + 2);
+                    #pragma unroll
+                    for(int r = 0; r < kv_step; r++) {
+                        kmat[r] = (quanKmat[r] - zp_val) * dq_scale_val;
+                    }
+                    for(int r = kv_step-1; r >= kv_left; r--) kmat[r] = 0;
+                    cm_slm_block_write(slm_K, slm_offset + k * kv_step * sizeof(half), kmat.format<half>());
+                }
+#else
                 cm_svm_block_read(reinterpret_cast<svmptr_t>( k_cache_base + dscale_offset), dscale);
                 cm_svm_block_read(reinterpret_cast<svmptr_t>( k_cache_base + dscale_offset + CMPA_BLOCK_SZ*sizeof(half)), zp);
 
@@ -122,24 +169,16 @@ void pa_lsc_u8(
 
                 for(int k = REG_K*wg_local_id; k < head_size; k += REG_K*(local_size/2)) {
                     cm_load<lsc::Normal>(quanKmat.format<uint8_t>(), b2dK.set_block_x(k));
-                    /*@bug: cm compiler in the tail process.
-                          :  loop combined with type convert.
-                        for(int r = 0; r < kv_left; r++) {
-                            kmat[r] =  quanKmat[r]-zp[r];
-                            kmat[r] = cm_mul<half>(kmat[r], dscale[r]);
-                        }
-                     wa: unroll all kv_step rows. set 0 to padding rows.
-                    */
                     #pragma unroll
                     for(int r = 0; r < kv_step; r++)  {
                         kmat[r] =  quanKmat[r]-zp[r];
                         kmat[r] = cm_mul<half>(kmat[r], dscale[r]);
                     }
-                    //clear unused data to 0.
                     for(int r = kv_step-1; r >= kv_left; r--)
                         kmat[r] = 0;
                     cm_slm_block_write(slm_K, slm_offset + k * kv_step * sizeof(half), kmat.format<half>());
                 }
+#endif
             } else {
                 cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base+dscale_offset), dscale);
                 cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base+dscale_offset+CMPA_BLOCK_SZ*sizeof(half)), zp);

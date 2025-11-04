@@ -47,6 +47,52 @@ def quan_per_token(kv):
         kv_zp = kv_zp.view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
         return torch.concat((kv_INT8, dq_scale, kv_zp), dim=-1)
 
+
+def quan_per_channel(k_block4d):
+    """Per-channel (by-channel) quantization for K cache.
+    Input shape: [blk_num, kv_heads, block_sz, head_size]
+    Output packed shape (uint8 view): [blk_num, kv_heads, head_size, block_sz + 4]
+        Layout per channel: [block_sz uint8 tokens] + [2 bytes half dq_scale] + [2 bytes half zp]
+        We store dequant scale (1/scale) like per-token path for kernel to multiply directly.
+    """
+    blk_num, kv_heads, block_sz, head_size = k_block4d.shape
+    # allocate uint8 tensor for packed result
+    packed = torch.zeros(blk_num, kv_heads, head_size, block_sz + 4, dtype=torch.uint8)
+    INTMAX = 255.0
+    INTMIN = 0.0
+    INTRANGE = INTMAX - INTMIN
+    for b in range(blk_num):
+        for h in range(kv_heads):
+            # slice for this block/head: [block_sz, head_size]
+            block_tokens = k_block4d[b, h]  # [block_sz, head_size]
+            # compute per-channel min/max along token dimension
+            ch_max = block_tokens.max(dim=0, keepdim=False).values  # [head_size]
+            ch_min = block_tokens.min(dim=0, keepdim=False).values
+            diff = ch_max - ch_min
+            # Reference behavior (paged_attention_gpu_test.cpp, has_xattention branch):
+            # if max==min : all zeros, scale=0, zp=min
+            same_mask = diff == 0
+            # quant scale (for mapping fp->u8) = 255 / diff (when diff>0)
+            quant_scale = torch.where(same_mask, torch.ones_like(diff), (INTRANGE / diff))  # avoid divide by zero by placeholder
+            zp_val = (-ch_min * quant_scale)  # zero point in quant space
+            # quantize
+            qvals_fp = block_tokens * quant_scale + zp_val  # [block_sz, head_size]
+            qvals_clamped = torch.round(qvals_fp).clamp(0, 255).to(dtype=torch.uint8)
+            # For constant channels force zeros explicitly (robust against numerical noise)
+            if torch.any(same_mask):
+                zero_channels = same_mask.nonzero(as_tuple=False).view(-1)
+                qvals_clamped[:, zero_channels] = 0
+            # dequant scale to store = diff/255; constant case => 0.0 (match reference)
+            dq_scale = torch.where(same_mask, torch.zeros_like(diff), (diff / INTRANGE)).to(dtype=torch.float16)
+            zp_half = torch.where(same_mask, ch_min, zp_val).to(dtype=torch.float16)
+            # pack
+            for c in range(head_size):
+                packed[b, h, c, :block_sz] = qvals_clamped[:, c]
+                # append dq_scale then zp as 2 bytes each
+                packed[b, h, c, block_sz:block_sz+2] = dq_scale[c].view(torch.uint8)
+                packed[b, h, c, block_sz+2:block_sz+4] = zp_half[c].view(torch.uint8)
+    return packed
+
 def dequant_per_token(kv, head_size, blk_size):
         blk_num, kv_head_num, _ = kv.shape
         kv_u8 = kv[:,:,:head_size * blk_size].to(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, head_size)
@@ -66,13 +112,35 @@ def dequant_per_token(kv, head_size, blk_size):
 
         return kv_dequant
 
+
+def dequant_per_channel(k_channel_packed, block_sz):
+    """Inverse of quan_per_channel.
+    Input: uint8 packed [blk_num, kv_heads, head_size, block_sz+4]
+    Output: fp16 tensor [blk_num, kv_heads, block_sz, head_size]
+    Stored tail per channel: [dq_scale(half), zp(half)] where dq_scale = (max-min)/255 and zp = zp_val (or min when constant)
+    Dequant formula aligns with per-token path: (q - zp) * dq_scale.
+    Constant channel (dq_scale==0) -> all zeros (matches current semantics).
+    """
+    blk_num, kv_heads, head_size, packed_stride = k_channel_packed.shape
+    assert packed_stride == block_sz + 4, f"Unexpected packed stride {packed_stride} != block_sz+4 ({block_sz+4})"
+    out = torch.empty(blk_num, kv_heads, block_sz, head_size, dtype=torch.float16)
+    for b in range(blk_num):
+        for h in range(kv_heads):
+            for c in range(head_size):
+                channel_region = k_channel_packed[b, h, c]
+                q_u8 = channel_region[:block_sz].to(dtype=torch.float16)
+                dq_scale_hf = channel_region[block_sz:block_sz+2].view(dtype=torch.float16)[0]
+                zp_hf = channel_region[block_sz+2:block_sz+4].view(dtype=torch.float16)[0]
+                out[b, h, :, c] = (q_u8 - zp_hf) * dq_scale_hf
+    return out
+
 def ALIGN_UP(x, y):
     return (x + y -1) // y * y
 
 def DIV_UP(x, y):
     return (x + y -1) // y
 class page_atten_cm:
-    def __init__(self, num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, is_causal = True, sparse_block_sz = 128):
+    def __init__(self, num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, is_causal = True, sparse_block_sz = 128, k_quan_mode: str = "token"):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
@@ -82,24 +150,32 @@ class page_atten_cm:
         self.trunk_sz = trunk_sz
         self.sparse_block_sz = sparse_block_sz
         self.compressed_kvcache = compressed_kvcache
+        assert k_quan_mode in ("token", "channel"), f"Unsupported k_quan_mode {k_quan_mode}"
+        self.k_quan_mode = k_quan_mode
 
         src1 = r'''#include "cm_pa_kernel.hpp"'''
         cwd = os.path.dirname(os.path.realpath(__file__))
         print(f"compiling {cwd} {num_heads=} {head_size=} {sparse_block_sz=}...")
 
         scale_factor = 1.0/(head_size**0.5)
-        self.kernels = cl.kernels(src1,
-                     (f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
-                      f" -DCMFLA_NUM_HEADS={num_heads}"
-                      f" -DCMFLA_NUM_KV_HEADS={num_kv_heads}"
-                      f" -DCMFLA_HEAD_SIZE={head_size}"
-                      f" -DCMFLA_SCALE_FACTOR={scale_factor}"
-                      f" -DCMFLA_IS_CAUSAL={int(is_causal)}"
-                      f" -DCMPA_BLOCK_SZ={self.block_sz}"
-                      f" -DSPARSE_BLOCK_SIZE={int(sparse_block_sz)}"
-                      f" -DCMPA_KVCACHE_U8={int(compressed_kvcache)}"
-                      f" -mdump_asm -g2")
-                     )
+        extra_flags = ""
+        if compressed_kvcache and self.k_quan_mode == "channel":
+            # Enable by-channel kernel path for K only
+            extra_flags += " -DCMPA_K_BY_CHANNEL=1"
+        self.kernels = cl.kernels(
+            src1,
+            (f'-cmc -Qxcm_jit_option="-abortonspill" -Qxcm_register_file_size=256  -mCM_printregusage -I{cwd}'
+             f" -DCMFLA_NUM_HEADS={num_heads}"
+             f" -DCMFLA_NUM_KV_HEADS={num_kv_heads}"
+             f" -DCMFLA_HEAD_SIZE={head_size}"
+             f" -DCMFLA_SCALE_FACTOR={scale_factor}"
+             f" -DCMFLA_IS_CAUSAL={int(is_causal)}"
+             f" -DCMPA_BLOCK_SZ={self.block_sz}"
+             f" -DSPARSE_BLOCK_SIZE={int(sparse_block_sz)}"
+             f" -DCMPA_KVCACHE_U8={int(compressed_kvcache)}"
+             f" {extra_flags}"
+             f" -mdump_asm -g2")
+        )
 
     def __call__(self, q, k, v, block_mask, n_repeats = 1):
         seq_len, _, head_size = q.shape
@@ -126,14 +202,24 @@ class page_atten_cm:
 
         # print(f'k.shape:{k.shape}, padded_k.shape:{padded_k.shape}')
         # reorder K,V from [L, H, S] to [block_num, H, block_size, S]
-        k_cache = padded_k.reshape(aligned_seqlen//self.block_sz, self.block_sz, self.num_kv_heads, self.head_size).transpose(1,2).contiguous()
-        v_cache = padded_v.reshape(aligned_seqlen//self.block_sz, self.block_sz, self.num_kv_heads, self.head_size).transpose(1,2).contiguous()
+        k_block4d = padded_k.reshape(aligned_seqlen//self.block_sz, self.block_sz, self.num_kv_heads, self.head_size).transpose(1,2).contiguous()  # [blk_num, kv_heads, block_sz, head_size]
+        v_block4d = padded_v.reshape(aligned_seqlen//self.block_sz, self.block_sz, self.num_kv_heads, self.head_size).transpose(1,2).contiguous()
         if self.compressed_kvcache:
-            k_cache = quan_per_token(k_cache)
-            v_cache = quan_per_token(v_cache)
+            if self.k_quan_mode == "channel":
+                # K by-channel, V still by-token
+                k_cache = quan_per_channel(k_block4d)  # [blk_num, kv_heads, head_size, block_sz+4]
+                v_cache = quan_per_token(v_block4d)
+                # flatten for kernel consumption
+                k_cache = k_cache.reshape(aligned_seqlen//self.block_sz, self.num_kv_heads, -1)
+                v_cache = v_cache.reshape(aligned_seqlen//self.block_sz, self.num_kv_heads, -1)
+            else:
+                k_cache = quan_per_token(k_block4d)
+                v_cache = quan_per_token(v_block4d)
+                k_cache = k_cache.reshape(aligned_seqlen//self.block_sz, self.num_kv_heads, -1)
+                v_cache = v_cache.reshape(aligned_seqlen//self.block_sz, self.num_kv_heads, -1)
         else:
-            k_cache = k_cache.reshape(aligned_seqlen//self.block_sz, self.num_kv_heads, -1)
-            v_cache = v_cache.reshape(aligned_seqlen//self.block_sz, self.num_kv_heads, -1)
+            k_cache = k_block4d.reshape(aligned_seqlen//self.block_sz, self.num_kv_heads, -1)
+            v_cache = v_block4d.reshape(aligned_seqlen//self.block_sz, self.num_kv_heads, -1)
         #output memory for the whole SDPA
         output = torch.zeros(seq_len, self.num_heads, self.head_size).to(torch.float16)
         blks_per_trunk = self.trunk_sz // self.block_sz
@@ -145,7 +231,17 @@ class page_atten_cm:
 
         kv_dtype = torch.uint8 if self.compressed_kvcache else torch.half
         #extra half zp and half scale per token. totally 4 bytes.
-        token_sz = (head_size+4) if self.compressed_kvcache else (head_size)
+        # token stride in flattened cache for BLOCK load logic (k & v may differ under by-channel mode)
+        if self.compressed_kvcache:
+            if self.k_quan_mode == "channel":
+                k_token_stride = (self.block_sz + 4)  # per channel region length
+                v_token_stride = (head_size + 4)      # per token quant (original scheme)
+            else:
+                k_token_stride = (head_size + 4)
+                v_token_stride = (head_size + 4)
+        else:
+            k_token_stride = head_size
+            v_token_stride = head_size
 
         if self.sparse_block_sz > 1:
             block_mask_list = []
@@ -194,8 +290,9 @@ class page_atten_cm:
                 block_indices =  torch.randperm(blk_num)
                 # block_indices =  torch.arange(blk_num)
                 # print(f'==============={block_indices=}')
-                sub_k = torch.zeros(blk_num, self.num_kv_heads, self.block_sz*token_sz).to(kv_dtype)
-                sub_v = torch.zeros(blk_num, self.num_kv_heads, self.block_sz*token_sz).to(kv_dtype)
+                # allocate sub-block working copy using flattened size from prepacked cache
+                sub_k = torch.zeros(blk_num, self.num_kv_heads, k_cache.shape[-1]).to(kv_dtype)
+                sub_v = torch.zeros(blk_num, self.num_kv_heads, v_cache.shape[-1]).to(kv_dtype)
                 for i in  range(len(block_indices)):
                     sub_k[block_indices[i],:] = k_cache[i,:]
                     sub_v[block_indices[i],:] = v_cache[i,:]
@@ -264,8 +361,8 @@ class page_atten_cm:
 
     @staticmethod
     @functools.cache
-    def create_instance(num_heads, num_kv_heads, head_size,block_sz, trunk_sz, compressed_kvcache, is_causal, sparse_block_sz):
-        return page_atten_cm(num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, is_causal, sparse_block_sz)
+    def create_instance(num_heads, num_kv_heads, head_size,block_sz, trunk_sz, compressed_kvcache, is_causal, sparse_block_sz, k_quan_mode="token"):
+        return page_atten_cm(num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, is_causal, sparse_block_sz, k_quan_mode)
 
 # sparse to dense mask
 def block_mask_to_attention_mask(block_mask: torch.Tensor, q_len: int, kv_len: int, sparse_block_size: int, trunk_sz: int) -> torch.Tensor:
@@ -395,7 +492,7 @@ def count_false_percentage(mask):
         false_percentage = 0.0
     return false_percentage
 
-def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, head_size = 80, block_sz=128, trunk_sz=512, compressed_kvcache=False, sparse_block_sz=128, sparse_ratio=0.5, check_acc = True):
+def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, head_size = 80, block_sz=128, trunk_sz=512, compressed_kvcache=False, sparse_block_sz=128, sparse_ratio=0.5, check_acc = True, k_quan_mode="token"):
     cl.profiling(True)
     torch.manual_seed(0)
     torch.set_printoptions(linewidth=1024)
@@ -460,7 +557,7 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
         density = 1.0 - percentage / 100.0
 
     is_causal = True  # PageAttention implictly means causal_mask
-    pa_cm = page_atten_cm.create_instance(num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, is_causal, sparse_block_sz)
+    pa_cm = page_atten_cm.create_instance(num_heads, num_kv_heads, head_size, block_sz, trunk_sz, compressed_kvcache, is_causal, sparse_block_sz, k_quan_mode=k_quan_mode)
     out = pa_cm(q, k, v, approx_simple_mask)
     latency = cl.finish()
 
@@ -492,6 +589,30 @@ def test_page_attn_causal_batch1(seq_len, num_heads = 16, num_kv_heads = 16, hea
             total_lat = sum(trunk_lat)
             print(f"[total]: PA_causal {seq_len=} , {trunks=}, density {density:.2f}, compressKVCache {compressed_kvcache}, MFU {flops/(total_lat*1e6):,.0f} GFLOPS, latency: {total_lat:.3f} ms")
             print(f'====================================================================================')
+
+    # Optional K/V dequant verification for both quantization modes
+    if compressed_kvcache:
+        try:
+            if k_quan_mode == "channel":
+                # Re-run packing locally to get packed K (shape [blk_num, kv_heads, head_size, block_sz+4])
+                blk_num = (seq_len + block_sz - 1) // block_sz
+                k_blocks = k.reshape(blk_num, block_sz, num_kv_heads, head_size).transpose(1,2).contiguous()
+                k_packed = quan_per_channel(k_blocks)
+                k_dequant = dequant_per_channel(k_packed, block_sz)  # [blk_num, kv_heads, block_sz, head_size]
+                # flatten back to original sequence length (trim padding)
+                k_dequant_seq = k_dequant.transpose(1,2).reshape(-1, num_kv_heads, head_size)[:seq_len]
+            else:
+                k_blocks = k.reshape(blk_num, block_sz, num_kv_heads, head_size).transpose(1,2).contiguous()
+                k_packed = quan_per_token(k_blocks)
+                k_dequant = dequant_per_token(k_packed.reshape(blk_num, num_kv_heads, block_sz*(head_size+2*2)), head_size, block_sz)
+                k_dequant_seq = k_dequant.transpose(1,2).reshape(-1, num_kv_heads, head_size)[:seq_len]
+
+            k_orig = k[:seq_len]
+            diff = (k_orig - k_dequant_seq).abs()
+            rel = diff / (k_orig.abs() + 1e-4)
+            print(f"[dequant_check][k_mode={k_quan_mode}] k_abs_err_mean={diff.mean():.4f} k_abs_err_max={diff.max():.4f} k_rel_err_mean={rel.mean():.4f} k_rel_err_max={rel.max():.4f}")
+        except Exception as e:
+            print(f"[dequant_check] skipped due to exception: {e}")
 
 def test_ov():
     cl.profiling(True)
@@ -623,13 +744,10 @@ def test_ov():
     ov_out = ov_out.reshape(-1, num_heads, head_size)
     check_close(ut_out, ov_out)
 
-    enable_dequant_check = True if compressed_kvcache else False
-    if enable_dequant_check: # TODO: there is bug in this check?
+    enable_dequant_check = compressed_kvcache
+    if enable_dequant_check:
         k_dequan = dequant_per_token(key_cache.reshape(-1, num_kv_heads, kv_block_size*(head_size+2*2)), head_size, kv_block_size)
         v_dequan = dequant_per_token(value_cache.reshape(-1, num_kv_heads, kv_block_size*(head_size+2*2)), head_size, kv_block_size)
-        # print(f'{k_dequan.shape = }, {v_dequan.shape = }')
-
-        # => q [q_len, num_heads, head_size], k/v [kv_len, num_kv_heads, head_size]
         q_3d = query.reshape(q_len, num_heads, head_size).contiguous()
         k_3d = k_dequan[:valid_num_blks, :].transpose(1,2).reshape(-1, num_kv_heads, head_size).contiguous()
         v_3d = v_dequan[:valid_num_blks, :].transpose(1,2).reshape(-1, num_kv_heads, head_size).contiguous()
@@ -649,6 +767,20 @@ def test_ov():
     check_close(ref, ut_out)
 
     print(f'{Colors.GREEN}test_ov done.{Colors.END}')
+
+
+def test_page_attn_modes():
+    """Quick accuracy sanity comparing token vs channel K quantization for small shapes."""
+    seq_len = 512
+    num_heads = 4
+    num_kv_heads = 4
+    head_size = 64
+    block_sz = 128
+    trunk_sz = 512
+    for k_mode in ["token", "channel"]:
+        print(f"[test_page_attn_modes] k_quan_mode={k_mode}")
+        test_page_attn_causal_batch1(seq_len, num_heads, num_kv_heads, head_size, block_sz=block_sz, trunk_sz=trunk_sz, compressed_kvcache=True, sparse_block_sz=1, sparse_ratio=0.0, check_acc=True, k_quan_mode=k_mode)
+
 
 if __name__ == "__main__":
 
@@ -692,10 +824,10 @@ if __name__ == "__main__":
     # perf for sparse X attention.
     if 1:
         seq_len = 32*1024
-        block_sz = 256
+        block_sz = 64
         trunk_sz=seq_len
         sparse_block_sz = 128
-
+        print("-----------------------------------------------------------------------------------------------------------------------------------------")
         test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 4, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=False, sparse_block_sz = sparse_block_sz, sparse_ratio=0.5, check_acc=False)
         # test_page_attn_causal_batch1(seq_len, num_heads = 32, num_kv_heads = 4, head_size = 128, block_sz=block_sz, trunk_sz=trunk_sz,  compressed_kvcache=True, sparse_block_sz = sparse_block_sz, sparse_ratio=0.5, check_acc=False)
 
