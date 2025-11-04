@@ -15,6 +15,16 @@
  *******************************************************************************/
 #include "cm_attention_common.hpp"
 
+#ifndef CMPA_KV_QUANT_MODE
+#define CMPA_KV_QUANT_MODE 1
+#endif
+
+#ifndef CMPA_K_QUANT_GROUPS
+#define CMPA_K_QUANT_GROUPS 1
+#endif
+
+static_assert(CMPA_K_QUANT_GROUPS == 1, "Only group_num = 1 is currently supported");
+
 #if CMPA_KVCACHE_U8
 template<bool use_causal_mask, int num_heads, int num_kv_heads, int head_size, int is_q_fused = 0>
 void pa_lsc_u8(
@@ -43,6 +53,21 @@ void pa_lsc_u8(
     //[block_num, kv_heads, block_size, head_size]
     constexpr uint kv_pitch = head_size * sizeof(uint8_t);
 
+    constexpr bool keys_by_channel = (CMPA_KV_QUANT_MODE == 2);
+    constexpr uint key_scale_elems = keys_by_channel ? head_size * CMPA_K_QUANT_GROUPS : CMPA_BLOCK_SZ;
+    constexpr uint key_scale_bytes = key_scale_elems * sizeof(half);
+    constexpr uint key_block_stride_bytes = CMPA_BLOCK_SZ * head_size + key_scale_bytes * 2;
+    constexpr uint key_scale_offset = CMPA_BLOCK_SZ * head_size;
+    constexpr uint key_zp_offset = key_scale_offset + key_scale_bytes;
+
+    constexpr uint value_scale_bytes = CMPA_BLOCK_SZ * sizeof(half);
+    constexpr uint value_block_stride_bytes = CMPA_BLOCK_SZ * head_size + value_scale_bytes * 2;
+    constexpr uint value_scale_offset = CMPA_BLOCK_SZ * head_size;
+    constexpr uint value_zp_offset = value_scale_offset + value_scale_bytes;
+
+    constexpr uint key_quan_blk_stride = num_kv_heads * key_block_stride_bytes;
+    constexpr uint value_quan_blk_stride = num_kv_heads * value_block_stride_bytes;
+
     vector<float, q_step> cur_max;
     vector<float, q_step> cur_sum;
 
@@ -70,7 +95,6 @@ void pa_lsc_u8(
 
     lsc::block_2d_desc<uint8_t, 1, kv_step, REG_K> b2dK(k_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
     lsc::block_2d_desc<uint8_t, 1, REG_K, REG_N> b2dV(v_cache_base, CMPA_BLOCK_SZ - 1, head_size*sizeof(uint8_t) - 1, kv_pitch - 1, 0, 0);
-    constexpr int quan_blk_stride = CMFLA_NUM_KV_HEADS * (CMFLA_HEAD_SIZE+4) * CMPA_BLOCK_SZ * sizeof(uint8_t);
     int causal_left = q_start+past_lens;
 
     constexpr uint slm_buff_size = kv_step * head_size * sizeof(half);
@@ -102,52 +126,70 @@ void pa_lsc_u8(
             }
 #endif
             auto cur_block_id = block_indices[kv_pos / CMPA_BLOCK_SZ];
-            uint32_t dscale_offset = cur_block_id*quan_blk_stride + \
-                        CMPA_BLOCK_SZ * head_size * sizeof(uint8_t) + kv_pos%CMPA_BLOCK_SZ*sizeof(half);
+            uint32_t key_block_offset = cur_block_id * key_quan_blk_stride;
+            uint32_t value_block_offset = cur_block_id * value_quan_blk_stride;
 
             uint slm_offset = (slm_buff_id_write & 3) * slm_buff_size;
-            vector<half, kv_step> dscale;
-            vector<half, kv_step> zp;
             int kv_left =  (kv_stop-kv_pos) > kv_step ? kv_step: (kv_stop-kv_pos);
 
             slm_buff_id_write ++;
             if (wg_local_id < local_size/2) {
-                cm_svm_block_read(reinterpret_cast<svmptr_t>( k_cache_base + dscale_offset), dscale);
-                cm_svm_block_read(reinterpret_cast<svmptr_t>( k_cache_base + dscale_offset + CMPA_BLOCK_SZ*sizeof(half)), zp);
-
                 matrix<half, kv_step, REG_K> kmat;
                 auto quanKmat = kmat.format<half, 2, kv_step * REG_K/2>()[1].format<uint8_t, kv_step, REG_K>();
-                b2dK.set_base_ptr(reinterpret_cast<uint8_t*>(k_cache_base+cur_block_id*quan_blk_stride));
+                b2dK.set_base_ptr(reinterpret_cast<uint8_t*>(k_cache_base + key_block_offset));
                 b2dK.set_block_y(kv_pos%CMPA_BLOCK_SZ);
+                if constexpr (!keys_by_channel) {
+                    vector<half, kv_step> dscale;
+                    vector<half, kv_step> zp;
+                    uint32_t scale_token_offset = (kv_pos % CMPA_BLOCK_SZ) * sizeof(half);
+                    cm_svm_block_read(reinterpret_cast<svmptr_t>(k_cache_base + key_block_offset + key_scale_offset + scale_token_offset), dscale);
+                    cm_svm_block_read(reinterpret_cast<svmptr_t>(k_cache_base + key_block_offset + key_zp_offset + scale_token_offset), zp);
 
-                for(int k = REG_K*wg_local_id; k < head_size; k += REG_K*(local_size/2)) {
-                    cm_load<lsc::Normal>(quanKmat.format<uint8_t>(), b2dK.set_block_x(k));
-                    /*@bug: cm compiler in the tail process.
-                          :  loop combined with type convert.
-                        for(int r = 0; r < kv_left; r++) {
+                    for(int k = REG_K*wg_local_id; k < head_size; k += REG_K*(local_size/2)) {
+                        cm_load<lsc::Normal>(quanKmat.format<uint8_t>(), b2dK.set_block_x(k));
+                        #pragma unroll
+                        for(int r = 0; r < kv_step; r++)  {
                             kmat[r] =  quanKmat[r]-zp[r];
                             kmat[r] = cm_mul<half>(kmat[r], dscale[r]);
                         }
-                     wa: unroll all kv_step rows. set 0 to padding rows.
-                    */
-                    #pragma unroll
-                    for(int r = 0; r < kv_step; r++)  {
-                        kmat[r] =  quanKmat[r]-zp[r];
-                        kmat[r] = cm_mul<half>(kmat[r], dscale[r]);
+                        for(int r = kv_step-1; r >= kv_left; r--)
+                            kmat[r] = 0;
+                        cm_slm_block_write(slm_K, slm_offset + k * kv_step * sizeof(half), kmat.format<half>());
                     }
-                    //clear unused data to 0.
-                    for(int r = kv_step-1; r >= kv_left; r--)
-                        kmat[r] = 0;
-                    cm_slm_block_write(slm_K, slm_offset + k * kv_step * sizeof(half), kmat.format<half>());
+                } else {
+                    for(int k = REG_K*wg_local_id; k < head_size; k += REG_K*(local_size/2)) {
+                        cm_load<lsc::Normal>(quanKmat.format<uint8_t>(), b2dK.set_block_x(k));
+                        vector<half, REG_K> channel_scale;
+                        vector<half, REG_K> channel_zp;
+                        cm_svm_block_read(reinterpret_cast<svmptr_t>(k_cache_base + key_block_offset + key_scale_offset + k * sizeof(half)), channel_scale);
+                        cm_svm_block_read(reinterpret_cast<svmptr_t>(k_cache_base + key_block_offset + key_zp_offset + k * sizeof(half)), channel_zp);
+
+                        #pragma unroll
+                        for(int r = 0; r < kv_step; ++r) {
+                            #pragma unroll
+                            for(int c = 0; c < REG_K; ++c) {
+                                half val = 0;
+                                if (r < kv_left) {
+                                    half q = static_cast<half>(quanKmat(r, c));
+                                    val = (q - channel_zp[c]) * channel_scale[c];
+                                }
+                                kmat(r, c) = val;
+                            }
+                        }
+                        cm_slm_block_write(slm_K, slm_offset + k * kv_step * sizeof(half), kmat.format<half>());
+                    }
                 }
             } else {
-                cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base+dscale_offset), dscale);
-                cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base+dscale_offset+CMPA_BLOCK_SZ*sizeof(half)), zp);
+                vector<half, kv_step> dscale;
+                vector<half, kv_step> zp;
+                uint32_t scale_token_offset = (kv_pos % CMPA_BLOCK_SZ) * sizeof(half);
+                cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base + value_block_offset + value_scale_offset + scale_token_offset), dscale);
+                cm_svm_block_read(reinterpret_cast<svmptr_t>(v_cache_base + value_block_offset + value_zp_offset + scale_token_offset), zp);
 
                 matrix<half, REG_K/2, REG_N*2> VmatVNNI;
                 matrix<half, REG_K, REG_N> Vmat;
                 auto quanVmat = Vmat.format<half, 2, REG_K*REG_N/2>().row(1).format<uint8_t, REG_K, REG_N>();
-                b2dV.set_base_ptr(reinterpret_cast<uint8_t*>(v_cache_base+cur_block_id*quan_blk_stride));
+                b2dV.set_base_ptr(reinterpret_cast<uint8_t*>(v_cache_base + value_block_offset));
                 b2dV.set_block_y(kv_pos%CMPA_BLOCK_SZ);
 
                 #pragma unroll

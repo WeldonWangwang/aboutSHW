@@ -121,7 +121,15 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
  #endif
 
 #if CMPA_KVCACHE_U8
-    uint kv_offset = hkv*(head_size+4)*pa_block_sz;
+    constexpr bool keys_by_channel = (CMPA_KV_QUANT_MODE == 2);
+    constexpr uint key_scale_elems = keys_by_channel ? head_size * CMPA_K_QUANT_GROUPS : CMPA_BLOCK_SZ;
+    constexpr uint key_scale_bytes = key_scale_elems * sizeof(half);
+    constexpr uint key_block_stride_bytes = CMPA_BLOCK_SZ * head_size + key_scale_bytes * 2;
+    constexpr uint value_scale_bytes = CMPA_BLOCK_SZ * sizeof(half);
+    constexpr uint value_block_stride_bytes = CMPA_BLOCK_SZ * head_size + value_scale_bytes * 2;
+
+    uint k_offset = hkv * key_block_stride_bytes;
+    uint v_offset = hkv * value_block_stride_bytes;
     pa_lsc_u8<is_causal, num_heads, num_kv_heads, head_size, 0>(
                             slm_K,
                             slm_V,
@@ -132,8 +140,8 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             q_len_sg, //q_step,
                             kv_seq_len, //kv_len,
                             reinterpret_cast<svmptr_t>(query + q_offset),
-                            reinterpret_cast<svmptr_t>(k_cache + kv_offset),
-                            reinterpret_cast<svmptr_t>(v_cache + kv_offset),
+                            reinterpret_cast<svmptr_t>(k_cache + k_offset),
+                            reinterpret_cast<svmptr_t>(v_cache + v_offset),
 #if SPARSE_BLOCK_SIZE > 1
                             reinterpret_cast<svmptr_t>(block_mask_base),
                             reinterpret_cast<svmptr_t>(wg_block_mask_base),

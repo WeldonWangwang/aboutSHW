@@ -12,6 +12,19 @@ import numpy as np
 
 from flashattn import get_flash0
 
+kv_cache_quantization_mode = os.environ.get("KV_CACHE_QUANT_MODE", "by_token")
+
+def _validate_quant_mode(mode: str) -> str:
+    mode = mode.strip().lower()
+    if mode not in {"by_token", "by_channel"}:
+        raise ValueError(f"Unsupported kv-cache quantization mode: {mode}")
+    return mode
+
+
+kv_cache_quantization_mode = _validate_quant_mode(kv_cache_quantization_mode)
+K_QUANT_GROUPS = 1
+FP16_BYTES = 2
+
 def get_cm_grf_width():
     cm_kernels = cl.kernels(r'''
     extern "C" _GENX_MAIN_ void cm_get_grf_width(int * info [[type("svmptr_t")]]) {
@@ -47,6 +60,37 @@ def quan_per_token(kv):
         kv_zp = kv_zp.view(dtype=torch.uint8).reshape(blk_num,kv_heads,-1)
         return torch.concat((kv_INT8, dq_scale, kv_zp), dim=-1)
 
+def quan_per_channel_k(kv):
+        blk_num, kv_heads, blksz, head_size = kv.shape
+        kv_max = kv.amax(dim=2, keepdim=True)
+        kv_min = kv.amin(dim=2, keepdim=True)
+        qrange = kv_max - kv_min
+
+        INTMAX = 255.0
+        INTMIN = 0.0
+        INTRANGE = INTMAX - INTMIN
+
+        kv_scale = (INTRANGE / qrange).to(dtype=torch.float16)
+        kv_zp = ((0.0 - kv_min) * kv_scale + INTMIN).to(dtype=torch.float16)
+        kv_INT8 = torch.round(kv * kv_scale + kv_zp).clamp(INTMIN, INTMAX).to(dtype=torch.uint8)
+
+        dq_scale = (1.0 / kv_scale).to(dtype=torch.float16)
+
+        scale_rows = FP16_BYTES * K_QUANT_GROUPS
+        meta_rows = scale_rows * 2
+        result = torch.empty((blk_num, kv_heads, blksz + meta_rows, head_size), dtype=torch.uint8)
+        result[:, :, :blksz, :] = kv_INT8.to(dtype=torch.uint8)
+
+        scale_bytes = dq_scale.view(torch.uint8).reshape(blk_num, kv_heads, 1, head_size, FP16_BYTES)
+        scale_bytes = scale_bytes.permute(0, 1, 4, 3).reshape(blk_num, kv_heads, scale_rows, head_size)
+        result[:, :, blksz:blksz + scale_rows, :] = scale_bytes
+
+        zp_bytes = kv_zp.view(torch.uint8).reshape(blk_num, kv_heads, 1, head_size, FP16_BYTES)
+        zp_bytes = zp_bytes.permute(0, 1, 4, 3).reshape(blk_num, kv_heads, scale_rows, head_size)
+        result[:, :, blksz + scale_rows:, :] = zp_bytes
+
+        return result.reshape(blk_num, kv_heads, -1).contiguous()
+
 def dequant_per_token(kv, head_size, blk_size):
         blk_num, kv_head_num, _ = kv.shape
         kv_u8 = kv[:,:,:head_size * blk_size].to(dtype=torch.float16).reshape(blk_num, kv_head_num, blk_size, head_size)
@@ -77,6 +121,7 @@ class page_atten_cm:
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
         self.is_causal = is_causal
+        self.kv_cache_quantization_mode = kv_cache_quantization_mode
         assert trunk_sz % block_sz == 0, f'Error: trunk_sz must be multiple of block_sz'
         self.block_sz = block_sz
         self.trunk_sz = trunk_sz
@@ -98,6 +143,8 @@ class page_atten_cm:
                       f" -DCMPA_BLOCK_SZ={self.block_sz}"
                       f" -DSPARSE_BLOCK_SIZE={int(sparse_block_sz)}"
                       f" -DCMPA_KVCACHE_U8={int(compressed_kvcache)}"
+                      f" -DCMPA_KV_QUANT_MODE={2 if self.kv_cache_quantization_mode == 'by_channel' else 1}"
+                      f" -DCMPA_K_QUANT_GROUPS={K_QUANT_GROUPS}"
                       f" -mdump_asm -g2")
                      )
 
@@ -129,7 +176,10 @@ class page_atten_cm:
         k_cache = padded_k.reshape(aligned_seqlen//self.block_sz, self.block_sz, self.num_kv_heads, self.head_size).transpose(1,2).contiguous()
         v_cache = padded_v.reshape(aligned_seqlen//self.block_sz, self.block_sz, self.num_kv_heads, self.head_size).transpose(1,2).contiguous()
         if self.compressed_kvcache:
-            k_cache = quan_per_token(k_cache)
+            if self.kv_cache_quantization_mode == "by_channel":
+                k_cache = quan_per_channel_k(k_cache)
+            else:
+                k_cache = quan_per_token(k_cache)
             v_cache = quan_per_token(v_cache)
         else:
             k_cache = k_cache.reshape(aligned_seqlen//self.block_sz, self.num_kv_heads, -1)
@@ -144,8 +194,15 @@ class page_atten_cm:
         max_blks = aligned_seqlen // self.block_sz
 
         kv_dtype = torch.uint8 if self.compressed_kvcache else torch.half
-        #extra half zp and half scale per token. totally 4 bytes.
-        token_sz = (head_size+4) if self.compressed_kvcache else (head_size)
+        if self.compressed_kvcache:
+            if self.kv_cache_quantization_mode == "by_channel":
+                k_block_elems = (self.block_sz + FP16_BYTES * 2 * K_QUANT_GROUPS) * self.head_size
+            else:
+                k_block_elems = self.block_sz * (self.head_size + FP16_BYTES * 2)
+            v_block_elems = self.block_sz * (self.head_size + FP16_BYTES * 2)
+        else:
+            k_block_elems = self.block_sz * self.head_size
+            v_block_elems = self.block_sz * self.head_size
 
         if self.sparse_block_sz > 1:
             block_mask_list = []
@@ -194,8 +251,8 @@ class page_atten_cm:
                 block_indices =  torch.randperm(blk_num)
                 # block_indices =  torch.arange(blk_num)
                 # print(f'==============={block_indices=}')
-                sub_k = torch.zeros(blk_num, self.num_kv_heads, self.block_sz*token_sz).to(kv_dtype)
-                sub_v = torch.zeros(blk_num, self.num_kv_heads, self.block_sz*token_sz).to(kv_dtype)
+                sub_k = torch.zeros(blk_num, self.num_kv_heads, k_block_elems).to(kv_dtype)
+                sub_v = torch.zeros(blk_num, self.num_kv_heads, v_block_elems).to(kv_dtype)
                 for i in  range(len(block_indices)):
                     sub_k[block_indices[i],:] = k_cache[i,:]
                     sub_v[block_indices[i],:] = v_cache[i,:]
