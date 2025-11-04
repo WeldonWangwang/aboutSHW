@@ -121,6 +121,32 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
  #endif
 
 #if CMPA_KVCACHE_U8
+#if defined(CMPA_K_BY_CHANNEL) && CMPA_K_BY_CHANNEL
+    // by-channel layout: [blk_num, kv_heads, head_size, block_sz+4] flattened => stride per kv_head = head_size*(block_sz+4)
+    uint k_kv_offset = hkv*head_size*(pa_block_sz + 4);
+    // V remains per-token quant: [blk_num, kv_heads, block_sz*(head_size+4)] => original offset still valid
+    uint v_kv_offset = hkv*(head_size+4)*pa_block_sz;
+    pa_lsc_u8<is_causal, num_heads, num_kv_heads, head_size, 0>(
+                            slm_K,
+                            slm_V,
+                            wg_local_id,
+                            local_size,
+                            q_start_sg, //q_start for SG,
+                            kv_stop,
+                            q_len_sg, //q_step,
+                            kv_seq_len, //kv_len,
+                            reinterpret_cast<svmptr_t>(query + q_offset),
+                            reinterpret_cast<svmptr_t>(k_cache + k_kv_offset),
+                            reinterpret_cast<svmptr_t>(v_cache + v_kv_offset),
+#if SPARSE_BLOCK_SIZE > 1
+                            reinterpret_cast<svmptr_t>(block_mask_base),
+                            reinterpret_cast<svmptr_t>(wg_block_mask_base),
+                            validate,
+#endif
+                            reinterpret_cast<svmptr_t>(output + q_offset),
+                            past_q_lens,
+                            block_indices);
+#else
     uint kv_offset = hkv*(head_size+4)*pa_block_sz;
     pa_lsc_u8<is_causal, num_heads, num_kv_heads, head_size, 0>(
                             slm_K,
@@ -142,6 +168,7 @@ extern "C" _GENX_MAIN_ void cm_page_attention(
                             reinterpret_cast<svmptr_t>(output + q_offset),
                             past_q_lens,
                             block_indices);
+#endif
 #else
     uint kv_offset = hkv*head_size*pa_block_sz;
     pa_kernel_lsc_prefetch_f16<is_causal, num_heads, num_kv_heads, head_size, 0, 16>(
